@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ultron-web
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: uvicorn render_app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ULTRON_WEB_PASSWORD
+        sync: false
+      - key: ULTRON_SESSION_SECRET
+        generateValue: true
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite

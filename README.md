@@ -241,6 +241,17 @@ For a cleaner startup experience on Windows:
 start_ultron.vbs
 ```
 
+## Deploy the web chat to Render
+
+The Render service runs a separate, lightweight web chat. It does not run the Windows desktop assistant and cannot access your PC's microphone, hotkey, files, or desktop controls. The desktop app remains launched locally as above.
+
+1. Push this project to a GitHub or GitLab repository you control.
+2. In Render, choose **New + → Blueprint**, connect that repository, and deploy the included `render.yaml`.
+3. In the Render service environment settings, set `GEMINI_API_KEY` to your Gemini API key and choose a strong `ULTRON_WEB_PASSWORD`. Render generates `ULTRON_SESSION_SECRET` for the service.
+4. Open the service URL from the Render dashboard and sign in with that password.
+
+The web service uses `requirements-render.txt` so it does not install the Windows and hardware dependencies needed by the desktop application. The included Blueprint selects Render's free plan; free services may spin down when idle and take longer to answer on the first request after waking.
+
 ## Configuration
 
 Core configuration files:
@@ -248,8 +259,8 @@ Core configuration files:
 - `config/api_keys.json` — Gemini and OpenRouter credentials
 - `config/app_settings.json` — voice, UI, startup, and automation preferences
 - `config/learned_rules.json` — persistent user preferences, habits, and behavioral directives
-- `config/patch_history.json` — audit log of autonomous hotfixes and rollbacks
-- `config/patch_backups/` — automatic atomic file backups for instant rollback
+- `%LOCALAPPDATA%/UltronAI/config/patch_history.json` — audit log of autonomous hotfixes and rollbacks
+- `%LOCALAPPDATA%/UltronAI/config/patch_backups/` — rollback backups retained for applied self-healing patches
 - `config/ultron_connect.json` — device pairing, gateway, and discovery settings
 - `config/discord_bot.json` — Discord bridge configuration
 
