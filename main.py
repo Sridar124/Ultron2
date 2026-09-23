@@ -1,6 +1,5 @@
 from core.user_paths import get_user_data_dir
 from core import undo as undo_stack
-from core import audio_devices
 from core.echo import EchoGuard
 from core.hotkey import PushToTalk
 from memory import config_manager
@@ -43,7 +42,6 @@ from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
-from actions.screen_processor  import screen_process
 from actions.meeting_assistant import MeetingAssistant
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
@@ -100,11 +98,16 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = get_user_data_dir() / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 STARTUP_LOG     = Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) / "Ultron" / "startup.log"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL          = "gemini-3.8-live"
+LIVE_MODEL_FALLBACK = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+CHUNK_SIZE          = 512
+# Google recommends 20–40 ms realtime audio chunks; 512 samples at 16 kHz is 32 ms.
+# Eight frames cap buffered microphone input at about 256 ms.
+AUDIO_QUEUE_MAXSIZE = 8
+_AUDIO_TURN_END = object()
 LIVE_CONNECT_TIMEOUT = 12
 
 
@@ -126,6 +129,57 @@ def _startup_log(message: str) -> None:
             f.write(message + "\n")
     except Exception:
         pass
+
+
+def _ensure_global_toggle_hotkey() -> None:
+    """Keep the Ctrl+U listener running after the UI process exits."""
+    if os.name != "nt":
+        return
+    helper = BASE_DIR / "ultron_hotkey.py"
+    if not helper.is_file():
+        return
+
+    pythonw = Path(sys.executable)
+    if pythonw.name.lower() == "python.exe":
+        candidate = pythonw.with_name("pythonw.exe")
+        if candidate.exists():
+            pythonw = candidate
+    venv_pythonw = BASE_DIR / ".venv" / "Scripts" / "pythonw.exe"
+    if not getattr(sys, "frozen", False) and venv_pythonw.exists():
+        pythonw = venv_pythonw
+
+    try:
+        import winreg
+        run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        command = subprocess.list2cmdline([str(pythonw), str(helper)])
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, run_key) as key:
+            winreg.SetValueEx(key, "UltronCtrlUToggle", 0, winreg.REG_SZ, command)
+    except Exception as exc:
+        _startup_log(f"Ctrl+U startup registration failed: {exc}")
+
+    try:
+        import psutil
+        helper_path = str(helper.resolve()).casefold()
+        for proc in psutil.process_iter(["cmdline"]):
+            try:
+                if any(helper_path == str(arg).casefold() for arg in (proc.info.get("cmdline") or [])):
+                    return
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [str(pythonw), str(helper)],
+            cwd=str(BASE_DIR),
+            creationflags=flags,
+            close_fds=True,
+        )
+        _startup_log("Ctrl+U global toggle listener started")
+    except Exception as exc:
+        _startup_log(f"Ctrl+U listener start failed: {exc}")
 
 
 def _ensure_desktop_shortcut() -> None:
@@ -438,6 +492,22 @@ def _is_gemini_limit_error(exc: Exception) -> bool:
         "1008",
         "access denied",
         "permission denied",
+    ))
+
+
+def _is_live_model_compatibility_error(exc: Exception) -> bool:
+    """Recognize model/access/config errors where an older Live model can help."""
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "model not found",
+        "unknown model",
+        "invalid model",
+        "model is not available",
+        "model is unavailable",
+        "model is not supported",
+        "unsupported model",
+        "not supported for this model",
+        "not enabled for this model",
     ))
 
 
@@ -1858,6 +1928,7 @@ class UltronLive:
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
         self._use_openrouter_first = False
+        self._live_model = LIVE_MODEL
         self._pending_attention: dict | None = None
         self._pending_reply_event: dict | None = None
         self._reply_mode = False
@@ -1887,6 +1958,9 @@ class UltronLive:
         self.ui.on_attention_action = self._on_attention_action
         self.ui.on_remote_clicked = self._make_remote_key
         self._echo = EchoGuard()
+        self._mic_handoff_lock = threading.Lock()
+        self._pending_mic_frame = None
+        self._mic_handoff_scheduled = False
         self._resume_handle = None
         self._ptt = None
         self._ptt_held = False
@@ -1897,11 +1971,6 @@ class UltronLive:
         except Exception:
             self._ptt_enabled = False
 
-        try:
-            audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
-            audio_devices.prefetch()
-        except Exception:
-            pass
         self._last_activity = time.monotonic()
         self._idle_prompts = [
             "Hey, you there?",
@@ -1935,6 +2004,44 @@ class UltronLive:
 
     def _on_ptt(self, held: bool) -> None:
         self._ptt_held = held
+
+    @staticmethod
+    def _offer_latest(queue, item) -> None:
+        """Offer an audio frame without allowing a slow consumer to build lag."""
+        if queue is None:
+            return
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # A concurrent consumer/producer may win the race; dropping this
+            # frame is preferable to blocking the PortAudio callback.
+            pass
+
+    def _schedule_mic_audio(self, loop, frame) -> None:
+        """Coalesce callback frames so a busy event loop never accumulates stale audio."""
+        with self._mic_handoff_lock:
+            self._pending_mic_frame = frame
+            if self._mic_handoff_scheduled:
+                return
+            self._mic_handoff_scheduled = True
+        try:
+            loop.call_soon_threadsafe(self._drain_mic_handoff)
+        except RuntimeError:
+            with self._mic_handoff_lock:
+                self._pending_mic_frame = None
+                self._mic_handoff_scheduled = False
+
+    def _drain_mic_handoff(self) -> None:
+        with self._mic_handoff_lock:
+            frame = self._pending_mic_frame
+            self._pending_mic_frame = None
+            self._mic_handoff_scheduled = False
+        self._offer_latest(self.out_queue, frame)
 
     def _reset_idle_activity(self):
         self._last_activity = time.monotonic()
@@ -2505,13 +2612,21 @@ class UltronLive:
 
             def _run_screen_process():
                 print("[Main] Starting screen_process thread")
-                success = screen_process(
-                    parameters={"angle": "screen", "text": text},
-                    response=None,
-                    player=self.ui,
-                    session_memory=None,
-                    image_bytes=img_bytes,
-                )
+                try:
+                    # Load OpenCV and screen capture only when the user asks for
+                    # screen analysis, keeping ordinary startup lightweight.
+                    from actions.screen_processor import screen_process
+
+                    success = screen_process(
+                        parameters={"angle": "screen", "text": text},
+                        response=None,
+                        player=self.ui,
+                        session_memory=None,
+                        image_bytes=img_bytes,
+                    )
+                except Exception as exc:
+                    print(f"[Main] Screen analysis failed: {exc}")
+                    success = False
                 print(f"[Main] screen_process finished: {success}")
                 if not success:
                     try:
@@ -3369,12 +3484,14 @@ class UltronLive:
             reply = ""
             gemini_first = not self._use_openrouter_first
             request_text = f"{memory_ctx}\n\nCurrent User Request:\n{text}" if memory_ctx else text
+            provider_errors = []
 
             if gemini_first:
                 try:
                     reply = _gemini_text_reply(request_text)
                 except Exception as e:
                     print(f"[ULTRON] ⚠️ Gemini fallback failed: {e}")
+                    provider_errors.append(f"Gemini: {e}")
                     if _is_gemini_limit_error(e):
                         self._use_openrouter_first = True
 
@@ -3389,18 +3506,40 @@ class UltronLive:
                     )
                 except Exception as e:
                     print(f"[ULTRON] ⚠️ OpenRouter fallback failed: {e}")
+                    provider_errors.append(f"OpenRouter: {e}")
                     if gemini_first and not self._use_openrouter_first and _is_gemini_limit_error(e):
                         self._use_openrouter_first = True
             reply = (reply or "").strip()
+            delivered = bool(reply)
             if not reply:
-                reply = "I’m ready, sir."
+                reply = (
+                    "I can’t reach an AI service to answer right now. "
+                    "Please check Ultron’s Gemini or OpenRouter connection and try again."
+                )
+                if provider_errors:
+                    print("[ULTRON] No text provider returned a reply: " + " | ".join(provider_errors))
             self.ui.write_log(f"Ultron: {reply}")
             try:
-                self.ui.finish_task_workspace(reply, "Reply delivered.", 100)
+                self.ui.finish_task_workspace(
+                    reply,
+                    "Reply delivered." if delivered else "AI service unavailable.",
+                    100 if delivered else 0,
+                )
             except Exception:
                 pass
             if not self.ui.muted:
-                self.ui.set_state("LISTENING")
+                try:
+                    # The text fallback has no Live audio response, so speak its
+                    # answer directly rather than leaving typed commands silent.
+                    from actions.attention_monitor import _speak_edge_native
+                    self.set_speaking(True)
+                    _speak_edge_native(reply)
+                except Exception as e:
+                    print(f"[ULTRON] ⚠️ Fallback speech failed: {e}")
+                finally:
+                    self.set_speaking(False)
+            else:
+                self.ui.set_state("MUTED")
         except Exception as e:
             msg = f"Fallback reply failed: {e}"
             print(f"[ULTRON] ⚠️ {msg}")
@@ -3524,13 +3663,41 @@ class UltronLive:
             "IMPORTANT: Do NOT speak an unprompted generic greeting (like 'Thank you, how can I help you?') upon connecting. "
             "Remain completely silent until the user speaks to you or asks a question."
         )
+        parts.append(
+            "Voice delivery: Speak in clear, complete English with crisp articulation, a calm, "
+            "measured, confident, polished cinematic-assistant tone, and natural pauses. Be "
+            "concise by default: answer directly in one or two complete sentences, then stop; "
+            "give more detail when the user asks or the task needs it. Avoid filler, repeated "
+            "acknowledgements, and narrating routine tool steps. Start the useful answer promptly. "
+            "For an action that will take time, give a brief spoken acknowledgement immediately, "
+            "then perform the action and report the result when it is ready."
+        )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            # Keep calls synchronous: this client waits for each tool result and
+            # then returns it to the model before speaking the final answer.
+            tools=[{
+                "function_declarations": [
+                    {**declaration, "behavior": "BLOCKING"}
+                    for declaration in TOOL_DECLARATIONS
+                ]
+            }],
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=80,
+                    silence_duration_ms=350,
+                )
+            ),
+            context_window_compression=types.ContextWindowCompressionConfig(
+                trigger_tokens=25_000,
+                sliding_window=types.SlidingWindow(target_tokens=8_000),
+            ),
             session_resumption=types.SessionResumptionConfig(handle=getattr(self, '_resume_handle', None)),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -3546,7 +3713,6 @@ class UltronLive:
         args = dict(fc.args or {})
 
         print(f"[ULTRON] 🔧 {name}  {args}")
-        self.speak(f"Working on {name.replace('_', ' ')}...")
         self.ui.set_state("THINKING")
 
         # Trigger Ultron Right Wing: Live Operations & Sources Telemetry
@@ -4022,10 +4188,8 @@ class UltronLive:
                 AutoHealEngine.record_last_error(tb_str)
             except Exception:
                 pass
-            self.speak_error(name, e)
 
         try:
-            self.speak(f"{name.replace('_', ' ')} completed.")
             self.ui.finish_task_workspace(result, "Task completed.", 100)
         except Exception:
             pass
@@ -4112,7 +4276,7 @@ class UltronLive:
                 continue
             self._phone_active = True
             try:
-                await self.out_queue.put(frame)
+                self._offer_latest(self.out_queue, frame)
             finally:
                 await asyncio.sleep(0.08)
                 if self._dashboard._phone_audio_queue.empty():
@@ -4128,9 +4292,6 @@ class UltronLive:
         loop = asyncio.get_event_loop()
         import numpy as np
 
-        _mic_name = config_manager.get_input_device()
-        _mic_dev = audio_devices.resolve(_mic_name, "input") if _mic_name else None
-
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 ultron_speaking = self._is_speaking
@@ -4139,10 +4300,7 @@ class UltronLive:
 
             if getattr(self, "_ptt_enabled", False) and not getattr(self, "_ptt_held", False):
                 data = np.zeros_like(indata).tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                self._schedule_mic_audio(loop, {"data": data, "mime_type": "audio/pcm"})
                 return
             
             if not self.ui.muted or getattr(self.ui, "_wakeword_listening", False):
@@ -4167,10 +4325,7 @@ class UltronLive:
                     else:
                         data = np.zeros_like(indata).tobytes()
                     
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                self._schedule_mic_audio(loop, {"data": data, "mime_type": "audio/pcm"})
 
         try:
             with sd.InputStream(
@@ -4178,10 +4333,11 @@ class UltronLive:
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
-                device=_mic_dev,
+                # None delegates device selection to the Windows system default.
+                device=None,
                 callback=callback,
             ):
-                print(f"[ULTRON] 🎤 Mic stream open ({_mic_name or 'Default'})")
+                print("[ULTRON] 🎤 Mic stream open (Windows system default)")
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
@@ -4201,10 +4357,23 @@ class UltronLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
+                        # Assistant audio must never be dropped: evicting an
+                        # old playback frame cuts words and makes replies sound
+                        # incomplete. The mic input queue is bounded separately.
+                        self.set_speaking(True)
                         self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
+
+                        if getattr(sc, "interrupted", False):
+                            # Stop queued speech immediately when the user barges in.
+                            while not self.audio_in_queue.empty():
+                                try:
+                                    self.audio_in_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            self.set_speaking(False)
 
                         if sc.output_transcription and sc.output_transcription.text:
                             self.set_speaking(True)
@@ -4229,7 +4398,10 @@ class UltronLive:
                                         pass
 
                         if sc.turn_complete:
-                            self.set_speaking(False)
+                            # Queue a fence after all audio from this turn. The
+                            # playback task clears SPEAKING only after it has
+                            # physically played every earlier chunk.
+                            self.audio_in_queue.put_nowait(_AUDIO_TURN_END)
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -4270,23 +4442,21 @@ class UltronLive:
         loop = asyncio.get_event_loop()
         import numpy as np
 
-        _spk_name = config_manager.get_output_device()
-        _spk_dev = audio_devices.resolve(_spk_name, "output") if _spk_name else None
-
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
-            device=_spk_dev,
+            # None delegates device selection to the Windows system default.
+            device=None,
         )
         stream.start()
         try:
             while True:
                 chunk = await self.audio_in_queue.get()
-                with self._speaking_lock:
-                    if not self._is_speaking:
-                        continue
+                if chunk is _AUDIO_TURN_END:
+                    self.set_speaking(False)
+                    continue
                 self.set_speaking(True)
                 try:
                     pcm = np.frombuffer(chunk, dtype=np.int16)
@@ -4333,7 +4503,6 @@ class UltronLive:
                 except Exception:
                     pass
             asyncio.create_task(self._consume_remote_commands())
-            asyncio.create_task(self._relay_phone_audio())
         try:
             self.ui.boot_set_progress(36, "Initializing AI client")
         except Exception:
@@ -4344,20 +4513,23 @@ class UltronLive:
             http_options={"api_version": "v1beta"}
         )
 
+        reconnect_delay = 2
         while True:
             try:
                 print("[ULTRON] 🔌 Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
-                connect_cm = client.aio.live.connect(model=LIVE_MODEL, config=config)
+                print(f"[ULTRON] Live model: {self._live_model}")
+                connect_cm = client.aio.live.connect(model=self._live_model, config=config)
                 session = await asyncio.wait_for(connect_cm.__aenter__(), timeout=LIVE_CONNECT_TIMEOUT)
+                reconnect_delay = 2
                 try:
                     async with asyncio.TaskGroup() as tg:
                         self.session        = session
                         self._loop          = asyncio.get_event_loop()
                         self.audio_in_queue = asyncio.Queue()
-                        self.out_queue      = asyncio.Queue()  # Fix: removed maxsize=10 to prevent dropping packets
+                        self.out_queue      = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
                         
                         print("[ULTRON] ✅ Connected.")
                         try:
@@ -4393,14 +4565,27 @@ class UltronLive:
             except Exception as e:
                 print(f"[ULTRON] ⚠️ {e}")
                 traceback.print_exc()
+                try:
+                    self.ui.write_log(f"ERR: Live voice connection failed: {str(e)[:180]}")
+                except Exception:
+                    pass
+                if self._live_model == LIVE_MODEL and _is_live_model_compatibility_error(e):
+                    self._live_model = LIVE_MODEL_FALLBACK
+                    reconnect_delay = 1
+                    print(f"[ULTRON] Switching to compatible Live model: {self._live_model}")
+                    try:
+                        self.ui.write_log("SYS: Switching to Ultron’s compatibility voice model.")
+                    except Exception:
+                        pass
                 if _is_gemini_limit_error(e):
                     self._use_openrouter_first = True
-                self.session = None
-                self._loop = None
+            self.session = None
+            self._loop = None
             self.set_speaking(False)
             self.ui.set_state("LISTENING")
-            print("[ULTRON] 🔄 Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            print(f"[ULTRON] 🔄 Reconnecting in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 def main():
     _startup_log("main entered")
@@ -4411,8 +4596,11 @@ def main():
             return
     except Exception as exc:
         _startup_log(f"GitHub update skipped: {exc}")
+    _ensure_global_toggle_hotkey()
     _ensure_desktop_shortcut()
-    ui = UltronUI(str(BASE_DIR / "assets" / "Ultron_Logo.png"), show_immediately=True)
+    # Start compact with the Ultron orb at the edge of the screen. Double-click
+    # the orb to open the full assistant window.
+    ui = UltronUI(str(BASE_DIR / "assets" / "Ultron_Logo.png"), show_immediately=False)
     dashboard = None
     dashboard_enabled = DashboardServer is not None and not _is_port_in_use(8000)
     if DashboardServer is not None and not dashboard_enabled:
@@ -4482,8 +4670,7 @@ def main():
 
 
 
-    ui.show_main()
-    _startup_log("ui shown")
+    _startup_log("Ultron floating symbol shown")
 
     # Initialize plugin manager and load any plugins from ./plugins
     try:
@@ -4597,7 +4784,6 @@ def main():
         threading.Thread(target=runner, daemon=True).start()
 
     start_runner()
-    ui.show_main()
     threading.Thread(
         target=_speak_daily_briefing,
         args=(ui,),

@@ -7886,6 +7886,13 @@ class FloatingLauncher(QWidget):
         self._state = "idle"
         self._status_line = "Ready"
         self._hovered = False
+        self._ultron_emblem = QPixmap(str(LOGO_FILE))
+        if not self._ultron_emblem.isNull():
+            self._ultron_emblem = self._ultron_emblem.scaled(
+                40, 40,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
 
         # Animation state
         self._anim_angle = 0.0
@@ -8079,31 +8086,36 @@ class FloatingLauncher(QWidget):
                 painter.setBrush(QBrush(QColor(head_c.red(), head_c.green(), head_c.blue(), head_alpha)))
                 painter.drawEllipse(QPointF(hx, hy), 1.6, 1.6)
 
-        # ── 6. Emblem: Hindi "ब्रह्मा" + Status Dot with Parallax ──
-        text_alpha = min(255, int((215 + breath * 40) * hover_boost))
-        painter.setPen(QPen(QColor(0, 0, 0, 180)))
-        painter.setFont(QFont("Nirmala UI", 11, QFont.Weight.Bold))
-        painter.drawText(QRectF(cx - 21.0 + gx, cy - 13.0 + gy, 44.0, 22.0), Qt.AlignmentFlag.AlignCenter, "\u092C\u094D\u0930\u0939\u094D\u092E\u093E")
-
-        # Crisp glowing text
-        painter.setPen(QPen(QColor(ar, ag, ab, text_alpha)))
-        painter.setFont(QFont("Nirmala UI", 11, QFont.Weight.Bold))
-        painter.drawText(QRectF(cx - 22.0 + gx, cy - 14.0 + gy, 44.0, 22.0), Qt.AlignmentFlag.AlignCenter, "\u092C\u094D\u0930\u0939\u094D\u092E\u093E")
-
-        # Tiny breathing status beacon directly below text
-        dot_alpha = min(255, int((150 + breath * 105) * hover_boost))
-        dot_color = QColor(ar, ag, ab, dot_alpha)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(dot_color))
-        painter.drawEllipse(QPointF(cx + gx, cy + 12.0 + gy), 2.0, 2.0)
+        # ── 6. Ultron emblem ──
+        if not self._ultron_emblem.isNull():
+            painter.save()
+            emblem_clip = QPainterPath()
+            emblem_clip.addEllipse(QPointF(cx + gx, cy + gy), 19.0, 19.0)
+            painter.setClipPath(emblem_clip)
+            painter.drawPixmap(
+                int(cx + gx - self._ultron_emblem.width() / 2),
+                int(cy + gy - self._ultron_emblem.height() / 2),
+                self._ultron_emblem,
+            )
+            painter.restore()
+        else:
+            painter.setPen(QColor(255, 255, 255, 235))
+            painter.setFont(QFont("Segoe UI", 20, QFont.Weight.Black))
+            painter.drawText(QRectF(cx - 19.0 + gx, cy - 20.0 + gy, 38.0, 40.0), Qt.AlignmentFlag.AlignCenter, "U")
 
         painter.end()
 
     def show_at(self, x: int | None = None, y: int | None = None):
-        if x is None or y is None:
-            screen = QApplication.primaryScreen().availableGeometry()
-            x = screen.right() - self.width() - 18
-            y = screen.bottom() - self.height() - 90
+        screen_obj = QApplication.primaryScreen()
+        screen = screen_obj.availableGeometry() if screen_obj else QRectF(0, 0, 1280, 720).toRect()
+        if x is None:
+            x = screen.right() - self.width() - 12
+        if y is None:
+            y = screen.top() + (screen.height() - self.height()) // 2
+        # Clamp restored positions back onto the active desktop when monitors
+        # have been disconnected or the saved coordinates are stale.
+        x = max(screen.left(), min(int(x), screen.right() - self.width() + 1))
+        y = max(screen.top(), min(int(y), screen.bottom() - self.height() + 1))
         self.move(x, y)
         self.show()
         self.raise_()
@@ -10986,8 +10998,9 @@ class SystemConnectivityPage(QWidget):
         except Exception:
             pass
 
-        # Ultron Audio Routing & Hardware Controls
-        audio_card = self._card("Audio Routing & Hardware Controls", "Select hardware audio interfaces, toggle Push-to-Talk, or inspect long-term memory.")
+        # Ultron audio uses the Windows system defaults to avoid routing to a
+        # secondary headset, webcam, or virtual endpoint.
+        audio_card = self._card("Audio Routing & Hardware Controls", "Ultron uses the microphone and speaker selected as defaults in Windows.")
         alay = audio_card.layout()
 
         # Mic selection row
@@ -10997,19 +11010,8 @@ class SystemConnectivityPage(QWidget):
         mic_row.addWidget(mic_lbl)
 
         self._mic_combo = QComboBox()
-        self._mic_combo.addItem("Default System Microphone")
-        try:
-            from core import audio_devices
-            from memory import config_manager
-            audio_devices.prefetch()
-            input_devs = audio_devices.list_devices("input")
-            for dev in input_devs:
-                self._mic_combo.addItem(dev)
-            saved_in = config_manager.get_input_device()
-            if saved_in and saved_in in input_devs:
-                self._mic_combo.setCurrentText(saved_in)
-        except Exception:
-            pass
+        self._mic_combo.addItem("Windows Default Microphone")
+        self._mic_combo.setEnabled(False)
         self._mic_combo.currentTextChanged.connect(self._on_input_device_changed)
         mic_row.addWidget(self._mic_combo, 1)
         alay.addLayout(mic_row)
@@ -11021,18 +11023,8 @@ class SystemConnectivityPage(QWidget):
         spk_row.addWidget(spk_lbl)
 
         self._spk_combo = QComboBox()
-        self._spk_combo.addItem("Default System Speaker")
-        try:
-            from core import audio_devices
-            from memory import config_manager
-            output_devs = audio_devices.list_devices("output")
-            for dev in output_devs:
-                self._spk_combo.addItem(dev)
-            saved_out = config_manager.get_output_device()
-            if saved_out and saved_out in output_devs:
-                self._spk_combo.setCurrentText(saved_out)
-        except Exception:
-            pass
+        self._spk_combo.addItem("Windows Default Speaker")
+        self._spk_combo.setEnabled(False)
         self._spk_combo.currentTextChanged.connect(self._on_output_device_changed)
         spk_row.addWidget(self._spk_combo, 1)
         alay.addLayout(spk_row)
